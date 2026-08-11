@@ -482,37 +482,62 @@
 
   /* ---------------- OCR ---------------- */
 
-  // Downscale large phone photos to a sane working size, upscale small ones,
-  // then grayscale + contrast-stretch before handing to Tesseract. The
-  // previous version only ever upscaled — a normal 12MP phone photo (e.g.
-  // 4032px wide) was left at full resolution, producing a canvas with
-  // millions of pixels to loop over and a multi-megabyte data URL, which is
-  // slow enough on a phone to look like it "can't read" the label at all.
+  // Resize toward a working resolution, then binarize with a *local*
+  // (adaptive) threshold rather than a single global contrast stretch.
+  // These labels have print streaking/noise baked into the paper itself —
+  // a global threshold either keeps the noise or wipes out faint strokes.
+  // Comparing each pixel to a blurred (locally-averaged) version of itself
+  // cancels out that slowly-varying background noise while keeping sharp
+  // character edges, which is what actually salvages small dot-matrix-style
+  // label text.
   function preprocessForOcr(dataUrl){
     return new Promise((resolve)=>{
       const img = new Image();
       img.onload = ()=>{
         try{
-          const TARGET_WIDTH = 1600;
+          const TARGET_WIDTH = 2000;
           let scale = TARGET_WIDTH / img.width;
-          scale = Math.max(0.3, Math.min(2, scale)); // always move toward ~1600px wide, never absurdly small/large
-          const canvas = document.createElement("canvas");
-          canvas.width = Math.max(1, Math.round(img.width * scale));
-          canvas.height = Math.max(1, Math.round(img.height * scale));
-          const ctx = canvas.getContext("2d");
-          ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-          try{
-            const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+          scale = Math.max(0.3, Math.min(2.5, scale));
+          const w = Math.max(1, Math.round(img.width * scale));
+          const h = Math.max(1, Math.round(img.height * scale));
+
+          const sharp = document.createElement("canvas");
+          sharp.width = w; sharp.height = h;
+          const sctx = sharp.getContext("2d");
+
+          const blurred = document.createElement("canvas");
+          blurred.width = w; blurred.height = h;
+          const bctx = blurred.getContext("2d");
+
+          if("filter" in sctx){
+            sctx.filter = "grayscale(1) contrast(1.25)";
+            sctx.drawImage(img, 0, 0, w, h);
+            bctx.filter = "grayscale(1) blur(6px)";
+            bctx.drawImage(img, 0, 0, w, h);
+
+            const sharpData = sctx.getImageData(0, 0, w, h);
+            const blurData = bctx.getImageData(0, 0, w, h);
+            const sd = sharpData.data, bd = blurData.data;
+            const C = 12; // how far below local average a pixel must be to count as "ink"
+            for(let i=0;i<sd.length;i+=4){
+              const v = sd[i] < (bd[i] - C) ? 0 : 255;
+              sd[i] = sd[i+1] = sd[i+2] = v;
+            }
+            sctx.putImageData(sharpData, 0, 0);
+          } else {
+            // older browsers without canvas filter support: plain contrast stretch fallback
+            sctx.drawImage(img, 0, 0, w, h);
+            const imgData = sctx.getImageData(0, 0, w, h);
             const d = imgData.data;
             for(let i=0;i<d.length;i+=4){
               const gray = 0.299*d[i] + 0.587*d[i+1] + 0.114*d[i+2];
-              let v = (gray - 128) * 1.45 + 128; // contrast boost
+              let v = (gray - 128) * 1.45 + 128;
               v = v < 0 ? 0 : (v > 255 ? 255 : v);
               d[i] = d[i+1] = d[i+2] = v;
             }
-            ctx.putImageData(imgData, 0, 0);
-          }catch(e){ /* canvas tainted (e.g. cross-origin source) — fall through with plain resize */ }
-          resolve(canvas.toDataURL("image/jpeg", 0.9));
+            sctx.putImageData(imgData, 0, 0);
+          }
+          resolve(sharp.toDataURL("image/png"));
         }catch(e){
           resolve(dataUrl); // any unexpected failure — just use the original photo
         }
@@ -520,6 +545,32 @@
       img.onerror = ()=> resolve(dataUrl);
       img.src = dataUrl;
     });
+  }
+
+  // A persistent worker (created once, reused for every scan) so language
+  // data only downloads on the first photo, and so we can set OCR engine
+  // parameters that Tesseract.recognize()'s shorthand doesn't expose.
+  let ocrWorkerPromise = null;
+  let currentOcrLogger = null;
+
+  async function getOcrWorker(){
+    if(!ocrWorkerPromise){
+      ocrWorkerPromise = (async ()=>{
+        const worker = await Tesseract.createWorker("eng", 1, {
+          logger: (m)=>{ if(currentOcrLogger) currentOcrLogger(m); }
+        });
+        // PSM 6 = "assume a single uniform block of text": these labels are a
+        // bordered table, and the default automatic layout analysis was
+        // getting confused by the barcode and grid lines, mangling the text.
+        await worker.setParameters({
+          tessedit_pageseg_mode: "6",
+          preserve_interword_spaces: "1"
+        });
+        return worker;
+      })();
+      ocrWorkerPromise.catch(()=>{ ocrWorkerPromise = null; }); // let a failed init be retried next scan
+    }
+    return ocrWorkerPromise;
   }
 
   async function runOcr(dataUrl){
@@ -533,15 +584,15 @@
       }
       const cleaned = await preprocessForOcr(dataUrl);
       ocrStatusText.textContent = "Loading reader…";
-      const recognizePromise = Tesseract.recognize(cleaned, "eng", {
-        logger: (m)=>{
-          if(m.status === "recognizing text"){
-            ocrStatusText.textContent = "Reading label… " + Math.round((m.progress||0)*100) + "%";
-          } else if(m.status){
-            ocrStatusText.textContent = m.status.charAt(0).toUpperCase() + m.status.slice(1) + "…";
-          }
+      currentOcrLogger = (m)=>{
+        if(m.status === "recognizing text"){
+          ocrStatusText.textContent = "Reading label… " + Math.round((m.progress||0)*100) + "%";
+        } else if(m.status){
+          ocrStatusText.textContent = m.status.charAt(0).toUpperCase() + m.status.slice(1) + "…";
         }
-      });
+      };
+      const worker = await getOcrWorker();
+      const recognizePromise = worker.recognize(cleaned);
       const timeoutPromise = new Promise((_, reject)=>
         setTimeout(()=> reject(new Error("Timed out after 45s waiting for the OCR engine — it likely failed to download its language/model files. Check your connection (or a firewall may be blocking tessdata/jsdelivr) and reload the page.")), 45000)
       );
@@ -573,7 +624,7 @@
      "NN Pieces" header is the sum of every Quantity, and is used afterwards
      to sanity-check the scanned rows. */
   function parseLabelText(raw){
-    const text = raw.toUpperCase();
+    const text = raw.toUpperCase().replace(/([A-Z]{2})\s+(\d{4}\b)/g, "$1$2"); // rejoin "JN 7094" -> "JN7094"
 
     // SKU: two letters + four digits, adidas-style article codes (repeats once per size line)
     const skuMatches = text.match(/\b[A-Z]{2}\d{4}\b/g) || [];

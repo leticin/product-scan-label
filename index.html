@@ -127,6 +127,13 @@
   .add-row-btn{font-family:var(--mono);font-size:11px;background:none;border:1px dashed var(--line-soft);width:100%;padding:9px;cursor:pointer;color:var(--grey);margin-bottom:6px;}
   .add-row-btn:hover{border-color:var(--ink);color:var(--ink);}
 
+  .qty-check{font-family:var(--mono);font-size:11px;padding:10px 12px;margin-top:4px;border:1px solid var(--line-soft);display:flex;justify-content:space-between;align-items:center;gap:10px;}
+  .qty-check.ok{border-color:var(--ink);background:var(--panel);}
+  .qty-check.bad{border-color:var(--stamp);color:var(--stamp);}
+  .qty-check .qc-label{color:var(--grey);}
+  .qty-check.bad .qc-label{color:var(--stamp);}
+  .qty-check strong{font-size:12px;}
+
   /* ---- Items table ---- */
   .items-wrap{border:1px solid var(--line-soft);}
   .item-row{display:grid;grid-template-columns:56px 1fr auto;gap:12px;padding:12px;border-bottom:1px solid var(--line-soft);align-items:center;}
@@ -249,6 +256,7 @@
         <div class="rows-label">Size / Quantity</div>
         <div id="sizeRows"></div>
         <button class="add-row-btn" id="addSizeRowBtn">+ Add size / qty row</button>
+        <div class="qty-check hidden" id="qtyCheck"></div>
 
         <div class="btn-row" style="margin-top:14px;">
           <button class="btn ghost" id="discardScanBtn">Discard</button>
@@ -459,12 +467,55 @@
   });
 
   /* ---------------- OCR ---------------- */
+
+  // Downscale large phone photos to a sane working size, upscale small ones,
+  // then grayscale + contrast-stretch before handing to Tesseract. The
+  // previous version only ever upscaled — a normal 12MP phone photo (e.g.
+  // 4032px wide) was left at full resolution, producing a canvas with
+  // millions of pixels to loop over and a multi-megabyte data URL, which is
+  // slow enough on a phone to look like it "can't read" the label at all.
+  function preprocessForOcr(dataUrl){
+    return new Promise((resolve)=>{
+      const img = new Image();
+      img.onload = ()=>{
+        try{
+          const TARGET_WIDTH = 1600;
+          let scale = TARGET_WIDTH / img.width;
+          scale = Math.max(0.3, Math.min(2, scale)); // always move toward ~1600px wide, never absurdly small/large
+          const canvas = document.createElement("canvas");
+          canvas.width = Math.max(1, Math.round(img.width * scale));
+          canvas.height = Math.max(1, Math.round(img.height * scale));
+          const ctx = canvas.getContext("2d");
+          ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+          try{
+            const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+            const d = imgData.data;
+            for(let i=0;i<d.length;i+=4){
+              const gray = 0.299*d[i] + 0.587*d[i+1] + 0.114*d[i+2];
+              let v = (gray - 128) * 1.45 + 128; // contrast boost
+              v = v < 0 ? 0 : (v > 255 ? 255 : v);
+              d[i] = d[i+1] = d[i+2] = v;
+            }
+            ctx.putImageData(imgData, 0, 0);
+          }catch(e){ /* canvas tainted (e.g. cross-origin source) — fall through with plain resize */ }
+          resolve(canvas.toDataURL("image/jpeg", 0.9));
+        }catch(e){
+          resolve(dataUrl); // any unexpected failure — just use the original photo
+        }
+      };
+      img.onerror = ()=> resolve(dataUrl);
+      img.src = dataUrl;
+    });
+  }
+
   async function runOcr(dataUrl){
     ocrStatus.classList.remove("hidden");
     reviewCard.classList.add("hidden");
-    ocrStatusText.textContent = "Loading reader…";
+    ocrStatusText.textContent = "Preparing image…";
     try{
-      const result = await Tesseract.recognize(dataUrl, "eng", {
+      const cleaned = await preprocessForOcr(dataUrl);
+      ocrStatusText.textContent = "Loading reader…";
+      const recognizePromise = Tesseract.recognize(cleaned, "eng", {
         logger: (m)=>{
           if(m.status === "recognizing text"){
             ocrStatusText.textContent = "Reading label… " + Math.round((m.progress||0)*100) + "%";
@@ -473,27 +524,38 @@
           }
         }
       });
+      const timeoutPromise = new Promise((_, reject)=>
+        setTimeout(()=> reject(new Error("OCR timed out after 45s — the reader engine may have failed to load (check your connection).")), 45000)
+      );
+      const result = await Promise.race([recognizePromise, timeoutPromise]);
       const text = result.data.text || "";
       rawTextOut.textContent = text.trim() || "(no text detected)";
       rawTextWrap.classList.remove("hidden");
       const parsed = parseLabelText(text);
       openReview(parsed);
     }catch(err){
-      console.error(err);
-      toast("Couldn't read that image — try retaking, or enter the fields manually.");
-      openReview({ sku:"", origin:"", rows:[{size:"",qty:""}] });
+      console.error("OCR failed:", err);
+      rawTextOut.textContent = "OCR error: " + (err && (err.message || err.toString()) || "unknown error");
+      rawTextWrap.classList.remove("hidden");
+      rawTextWrap.open = true;
+      toast("Couldn't read that image automatically — check the details below, or fill the fields in by hand.");
+      openReview({ sku:"", origin:"", rows:[{size:"",qty:""}], expectedPieces:null });
     }finally{
       ocrStatus.classList.add("hidden");
     }
   }
 
-  /* Heuristic parser tuned to adidas-style delivery-note labels:
-     "Article/Artikel  Origin  Article No Cust  Size/Qty" table,
-     SKU like KR9761 / JN7094, origin as 2-letter code, size/qty as NN/N pairs. */
+  /* Parser tuned to adidas-style delivery-note labels:
+     "Artikel/Article | Origin | Article No Cust | Size/Qty" table, repeated
+     one line per size — e.g. "JN7094  JO  28/1", "JN7094  JO  32/13"…
+     Artikel -> SKU. Origin -> Origin. Size/Qty -> split on "/": the number
+     BEFORE the slash is Size, the number AFTER it is Quantity. The label's
+     "NN Pieces" header is the sum of every Quantity, and is used afterwards
+     to sanity-check the scanned rows. */
   function parseLabelText(raw){
     const text = raw.toUpperCase();
 
-    // SKU: two letters + four digits, adidas-style article codes
+    // SKU: two letters + four digits, adidas-style article codes (repeats once per size line)
     const skuMatches = text.match(/\b[A-Z]{2}\d{4}\b/g) || [];
     let sku = "";
     if(skuMatches.length){
@@ -502,21 +564,23 @@
       sku = Object.keys(counts).sort((a,b)=>counts[b]-counts[a])[0];
     }
 
-    // Origin: known-ish 2-letter country/origin codes appearing as standalone tokens
+    // Origin: known-ish 2-letter country/origin codes appearing as standalone tokens.
+    // Not every label has one — leave blank rather than guess if nothing matches.
     const knownOrigins = ["VN","JO","CN","ID","KH","BD","IN","TH","MM","LK","TR","IT","PT","DE","PK","PH","MX","BR","EG","MA"];
     let origin = "";
     const tokens = text.split(/[^A-Z]+/).filter(Boolean);
-    for(const t of tokens){
-      if(t.length===2 && knownOrigins.includes(t)){ origin = t; break; }
+    const counts = {};
+    tokens.forEach(t=>{ if(t.length===2 && knownOrigins.includes(t)) counts[t]=(counts[t]||0)+1; });
+    if(Object.keys(counts).length){
+      origin = Object.keys(counts).sort((a,b)=>counts[b]-counts[a])[0];
     }
 
-    // Size/Qty pairs: NN/N or NN/NN patterns
-    const pairMatches = [...text.matchAll(/\b(\d{2})\s*\/\s*(\d{1,3})\b/g)];
-    const rows = pairMatches
-      .filter(m => m[1] !== "20" || true) // no-op filter placeholder for future tuning
-      .map(m => ({ size:m[1], qty:m[2] }));
+    // Size/Qty pairs, one per size line: "SIZE/QUANTITY", e.g. 28/1, 32/13, 100/6.
+    // Size is the number before the slash, Quantity is the number after it.
+    const pairMatches = [...text.matchAll(/\b(\d{2,3})\s*\/\s*(\d{1,4})\b/g)];
+    const rows = pairMatches.map(m => ({ size:m[1], qty:m[2] }));
 
-    // de-duplicate identical rows that OCR may have doubled
+    // de-duplicate identical rows that OCR may have doubled up
     const seen = new Set();
     const dedup = [];
     rows.forEach(r=>{
@@ -524,10 +588,16 @@
       if(!seen.has(k)){ seen.add(k); dedup.push(r); }
     });
 
+    // "NN Pieces" header total, used to sanity-check the quantity sum
+    let expectedPieces = null;
+    const piecesMatch = text.match(/\b(\d{1,5})\s*PIECES?\b/);
+    if(piecesMatch) expectedPieces = parseInt(piecesMatch[1], 10);
+
     return {
       sku: sku,
       origin: origin,
-      rows: dedup.length ? dedup : [{size:"",qty:""}]
+      rows: dedup.length ? dedup : [{size:"",qty:""}],
+      expectedPieces: expectedPieces
     };
   }
 
@@ -536,11 +606,14 @@
   const fieldOrigin = document.getElementById("fieldOrigin");
   const sizeRowsEl = document.getElementById("sizeRows");
   const reviewCount = document.getElementById("reviewCount");
+  const qtyCheckEl = document.getElementById("qtyCheck");
+  let expectedPiecesForReview = null;
 
   function openReview(parsed){
     fieldSku.value = parsed.sku || "";
     fieldOrigin.value = parsed.origin || "";
     pendingRows = parsed.rows.map(r=>({...r, id:uid()}));
+    expectedPiecesForReview = (parsed.expectedPieces === undefined) ? null : parsed.expectedPieces;
     renderSizeRows();
     reviewCard.classList.remove("hidden");
     reviewCard.scrollIntoView({behavior:"smooth", block:"nearest"});
@@ -556,7 +629,10 @@
         <input type="text" inputmode="numeric" placeholder="Qty" value="${escapeHtml(row.qty)}" data-field="qty">
         <button type="button" title="Remove row">✕</button>`;
       div.querySelectorAll("input").forEach(inp=>{
-        inp.addEventListener("input", ()=> row[inp.dataset.field] = inp.value);
+        inp.addEventListener("input", ()=>{
+          row[inp.dataset.field] = inp.value;
+          updateQtyCheck();
+        });
       });
       div.querySelector("button").addEventListener("click", ()=>{
         pendingRows = pendingRows.filter(r=>r.id !== row.id);
@@ -565,6 +641,22 @@
       sizeRowsEl.appendChild(div);
     });
     reviewCount.textContent = pendingRows.length + (pendingRows.length===1 ? " row" : " rows");
+    updateQtyCheck();
+  }
+
+  function updateQtyCheck(){
+    const sum = pendingRows.reduce((s,r)=> s + (parseInt(r.qty,10)||0), 0);
+    if(expectedPiecesForReview === null || expectedPiecesForReview === undefined){
+      qtyCheckEl.classList.add("hidden");
+      return;
+    }
+    qtyCheckEl.classList.remove("hidden");
+    const ok = sum === expectedPiecesForReview;
+    qtyCheckEl.classList.toggle("ok", ok);
+    qtyCheckEl.classList.toggle("bad", !ok);
+    qtyCheckEl.innerHTML = ok
+      ? `<span class="qc-label">Quantity sum matches label</span><strong>${sum} / ${expectedPiecesForReview}</strong>`
+      : `<span class="qc-label">Sum doesn't match "${expectedPiecesForReview} Pieces" — check for a missed or misread row</span><strong>${sum} / ${expectedPiecesForReview}</strong>`;
   }
 
   document.getElementById("addSizeRowBtn").addEventListener("click", ()=>{
@@ -706,10 +798,10 @@
     const ws = wb.addWorksheet("Scan Report");
     ws.columns = [
       { header:"SKU", key:"sku", width:16 },
-      { header:"SIZE", key:"size", width:10 },
-      { header:"QUANTITY", key:"qty", width:12 },
-      { header:"IMAGE", key:"image", width:16 },
-      { header:"ORIGIN", key:"origin", width:10 },
+      { header:"Origin", key:"origin", width:10 },
+      { header:"Size", key:"size", width:10 },
+      { header:"Quantity", key:"qty", width:12 },
+      { header:"Image", key:"image", width:16 },
     ];
     ws.getRow(1).font = { bold:true };
     ws.getRow(1).eachCell(c=>{
@@ -721,7 +813,7 @@
 
     let rowIdx = 2;
     for(const item of items){
-      const row = ws.addRow({ sku:item.sku, size:item.size, qty:item.qty, image:"", origin:item.origin || "" });
+      const row = ws.addRow({ sku:item.sku, origin:item.origin || "", size:item.size, qty:item.qty, image:"" });
       row.height = 54;
       if(item.imageBase64){
         try{
@@ -729,7 +821,7 @@
           if(match){
             const ext = match[1] === "jpg" ? "jpeg" : match[1];
             const imgId = wb.addImage({ base64: item.imageBase64, extension: ext === "jpeg" ? "jpeg" : ext });
-            ws.addImage(imgId, { tl:{col:3, row:rowIdx-1}, ext:{width:48, height:48} });
+            ws.addImage(imgId, { tl:{col:4, row:rowIdx-1}, ext:{width:48, height:48} });
           }
         }catch(e){ /* skip broken image */ }
       } else if(item.imageUrl){

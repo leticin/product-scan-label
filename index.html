@@ -111,6 +111,11 @@
   details.raw-text summary{cursor:pointer;}
   details.raw-text pre{white-space:pre-wrap;background:var(--panel);padding:10px;margin-top:8px;border:1px solid var(--line-soft);max-height:160px;overflow:auto;}
 
+  .error-banner{border:2px solid var(--stamp);background:#FDECEC;padding:14px;margin:14px 2px;}
+  .error-banner .eb-title{font-family:var(--sans);font-weight:700;font-size:14px;color:var(--stamp);margin-bottom:6px;}
+  .error-banner .eb-detail{font-family:var(--mono);font-size:11px;color:var(--ink);background:var(--paper);border:1px solid var(--line-soft);padding:8px;margin-bottom:8px;word-break:break-word;user-select:all;}
+  .error-banner .eb-hint{font-family:var(--mono);font-size:11px;color:var(--grey);line-height:1.5;}
+
   .review{border:2px solid var(--ink);margin:18px 0;}
   .review-head{display:flex;justify-content:space-between;align-items:center;background:var(--ink);color:var(--paper);padding:10px 14px;font-family:var(--mono);font-size:11px;letter-spacing:.08em;text-transform:uppercase;}
   .review-body{padding:14px;}
@@ -229,6 +234,12 @@
     <div class="status-line hidden" id="ocrStatus">
       <div class="spinner"></div>
       <span id="ocrStatusText">Reading label…</span>
+    </div>
+
+    <div class="error-banner hidden" id="errorBanner">
+      <div class="eb-title">Couldn't read this automatically</div>
+      <div class="eb-detail" id="errorBannerDetail"></div>
+      <div class="eb-hint">Fill the fields in below by hand, or retake the photo. If this keeps happening, copy the line above and send it back to me — it tells us exactly what failed.</div>
     </div>
 
     <details class="raw-text hidden" id="rawTextWrap">
@@ -426,6 +437,8 @@
   const rawTextWrap = document.getElementById("rawTextWrap");
   const rawTextOut = document.getElementById("rawTextOut");
   const reviewCard = document.getElementById("reviewCard");
+  const errorBanner = document.getElementById("errorBanner");
+  const errorBannerDetail = document.getElementById("errorBannerDetail");
 
   captureBtn.addEventListener("click", ()=> cameraInput.click());
   retakeBtn.addEventListener("click", ()=> cameraInput.click());
@@ -457,6 +470,7 @@
     retakeBtn.style.display = "none";
     ocrStatus.classList.add("hidden");
     rawTextWrap.classList.add("hidden");
+    errorBanner.classList.add("hidden");
     reviewCard.classList.add("hidden");
     pendingRows = [];
   }
@@ -510,9 +524,13 @@
 
   async function runOcr(dataUrl){
     ocrStatus.classList.remove("hidden");
+    errorBanner.classList.add("hidden");
     reviewCard.classList.add("hidden");
     ocrStatusText.textContent = "Preparing image…";
     try{
+      if(typeof Tesseract === "undefined"){
+        throw new Error("OCR library did not load (Tesseract is undefined). Usually means cdn.jsdelivr.net was blocked — check your network/firewall or try a different connection, then reload the page.");
+      }
       const cleaned = await preprocessForOcr(dataUrl);
       ocrStatusText.textContent = "Loading reader…";
       const recognizePromise = Tesseract.recognize(cleaned, "eng", {
@@ -525,7 +543,7 @@
         }
       });
       const timeoutPromise = new Promise((_, reject)=>
-        setTimeout(()=> reject(new Error("OCR timed out after 45s — the reader engine may have failed to load (check your connection).")), 45000)
+        setTimeout(()=> reject(new Error("Timed out after 45s waiting for the OCR engine — it likely failed to download its language/model files. Check your connection (or a firewall may be blocking tessdata/jsdelivr) and reload the page.")), 45000)
       );
       const result = await Promise.race([recognizePromise, timeoutPromise]);
       const text = result.data.text || "";
@@ -535,10 +553,12 @@
       openReview(parsed);
     }catch(err){
       console.error("OCR failed:", err);
-      rawTextOut.textContent = "OCR error: " + (err && (err.message || err.toString()) || "unknown error");
+      const detail = (err && (err.message || err.toString())) || "Unknown error";
+      errorBannerDetail.textContent = detail;
+      errorBanner.classList.remove("hidden");
+      rawTextOut.textContent = "OCR error: " + detail;
       rawTextWrap.classList.remove("hidden");
       rawTextWrap.open = true;
-      toast("Couldn't read that image automatically — check the details below, or fill the fields in by hand.");
       openReview({ sku:"", origin:"", rows:[{size:"",qty:""}], expectedPieces:null });
     }finally{
       ocrStatus.classList.add("hidden");
